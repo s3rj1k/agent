@@ -1,0 +1,192 @@
+# Required. Read from $AGENT_CONFIG, else $XDG_CONFIG_HOME or ~/.config under
+# agent/config.yaml. Unknown keys are rejected, so a typo fails at startup.
+
+# Sent verbatim and never templated, so braces are safe. Your tools describe
+# themselves, so this covers how to work rather than how to call them.
+system_prompt: |
+  You are an autonomous operator on a Linux host. You were given one goal and
+  you carry it out yourself, start to finish.
+
+  Nobody is watching. Never ask a question, never request permission, never
+  announce a plan and stop. When a choice comes up, take the most reasonable
+  option, say so in one line, and keep going.
+
+  Orient before you act. Check where you are, what files matter, and whether a
+  command exists before assuming it. Then work in small steps you can verify,
+  one focused command at a time rather than a pipeline you cannot debug.
+
+  Your context is trimmed as it fills. The oldest turns are dropped with no
+  marker where they were, so work you did early can simply be gone from view.
+  Before you conclude you never did something, or repeat it, search for it with
+  remember. A single oversized command output is replaced in place instead, and
+  says so.
+
+  Write each step in whatever language suits it. The shell is the default and
+  the right choice for most things, but when logic would turn into awkward
+  quoting or fragile text munging, run python or another interpreter directly
+  instead of forcing it through the shell.
+
+  When something fails, diagnose before retrying. Read the error, inspect the
+  state, change something. Never run the same failing command twice unchanged.
+
+  You have full privileges and no safety net. Be deliberate with destructive
+  commands, prefer explicit paths to wildcards, and list what a glob matches
+  before you delete it.
+
+  Never rewrite git history. No amend, no rebase, no reset that moves a branch,
+  no force push, no filter-branch. Correct a mistake with a new commit on top,
+  and keep the history linear by never creating a merge commit.
+
+  Your step budget is finite and enforced outside your control. If you are told
+  it is running low, stop exploring and deliver the best result you have.
+
+  Finish once you have observed the intended end state, not once a command
+  exited 0. Your final message must be plain text with no tool call, and must
+  say what you did, the evidence it worked, and anything you could not do.
+
+endpoint:
+  # Any server speaking the OpenAI Chat Completions API, so Ollama, vLLM,
+  # llama.cpp and OpenRouter all work here. Include the version path.
+  base_url: https://integrate.api.nvidia.com/v1
+
+  # Generate a NIM key at https://build.nvidia.com/settings/api-keys
+  # A whole-value ${VAR} expands and must resolve. Use "" to send no auth.
+  api_key: ${NVIDIA_API_KEY}
+
+  # Whatever model id the endpoint accepts.
+  model: nvidia/nemotron-3.5-lightning-30b-a3b
+
+  # Nothing can discover this for an arbitrary endpoint, so set it to match
+  # the model. Anything under 4096 is ignored and the default is used instead.
+  context_window: 131072
+
+  # Trim point as a fraction of context_window. Past it the oldest messages are
+  # dropped from the request, though the system prompt and the goal are pinned.
+  context_fraction: 0.75
+
+  # Sent as max_completion_tokens. 0 omits it, which is what endpoints wanting
+  # the older max_tokens spelling need, so set that under params instead.
+  max_tokens: 0
+
+  # Ceiling on one endpoint call, covering every retry and backoff rather than
+  # each attempt. 0s means none. A deadline under 30s leaves no room to retry.
+  request_timeout: 0
+
+  # Retries per request on 408, 409, 429 and any 5xx, for chat, summary and
+  # embedding alike. Waits double from 30s to a 5m cap, which caps Retry-After.
+  max_retries: 3
+
+  # Minimum gap between requests, counting the summary and embedding calls
+  # remember makes. 0s disables. 1.6s keeps a run under a 40 per minute limit.
+  request_delay: 1.6s
+
+  # Extra HTTP headers, for endpoints behind a gateway.
+  headers: {}
+
+  # Extra fields merged into the chat request body. model, messages and stream
+  # always win, and tool related keys are dropped from the toolless summary.
+  params:
+    temperature: 1
+    top_p: 0.95
+    max_tokens: 16384
+    reasoning_budget: 8192
+    chat_template_kwargs:
+      enable_thinking: true
+
+budget:
+  # The loop is otherwise unbounded. max_iterations is a hard ceiling, checked
+  # after every iteration and shown on each turn line.
+  max_iterations: 200
+
+  # Wall clock limit for the whole run. 0s means none. With under 30s left,
+  # retries stop early rather than sleeping past it.
+  deadline: 0s
+
+  # Required with no default. Go template sent to the model when the ceiling is
+  # hit. Fields are .TotalIterations .MaxIterations .PendingToolCalls.
+  exhausted_message: >-
+    Step budget exhausted after {{.TotalIterations}} of {{.MaxIterations}}
+    shell iterations. No further commands will run. Report what you
+    accomplished, the evidence it worked, and what remains unfinished.
+
+shell:
+  # The default interpreter, run as <program> -c '<command>'. Empty means
+  # /bin/bash. The model can name a different one per call, so python3 or node.
+  program: /bin/bash
+
+  # Working directory for commands. Empty means the current one.
+  dir: ""
+
+  command_timeout: 2m
+
+  # Ceiling on a timeout the model asks for.
+  max_command_timeout: 15m
+
+session:
+  # Holds one <session-uuid>.db per conversation. A relative path resolves
+  # against the agent's own directory rather than shell.dir.
+  dir: ".agent"
+
+remember:
+  # The recall half of context_fraction above, which decides what the model can
+  # still see while this decides what it can find again after that.
+
+  # Empty disables all of it. Set it and every turn plus the goal is summarised
+  # and embedded, costing roughly one completion and one embedding call each.
+  embedding_model: nvidia/nemotron-3-embed-1b
+
+  # Vector size. 0 takes whatever the model returns. Changing it mid session
+  # makes existing rows unsearchable rather than wrong.
+  dimensions: 0
+
+  # Extra fields merged into every embeddings request body. Retrieval models
+  # need to be told they are reading a stored passage rather than a question.
+  embedding_params:
+    input_type: passage
+    truncate: END
+
+  # Merged on top of the above when embedding a search query. Asymmetric models
+  # lose accuracy badly when a question is embedded as though it were a passage.
+  embedding_query_params:
+    input_type: query
+
+  # How many matches a search returns when the model does not ask for a count.
+  # Both this and a count the model asks for are capped at 25.
+  top_k: 5
+
+  # Ceiling on one whole fetch by id, lowered to the context budget when that
+  # is smaller, so pulling an entry back cannot undo the trimming just done.
+  max_fetch_bytes: 65536
+
+  # Model for the summary call. Empty uses endpoint.model. Summarising is far
+  # easier than the main loop, so a small fast model belongs here.
+  summary_model: "openai/gpt-oss-20b"
+
+  # Replaces keys of endpoint.params for the summary call only, whole nested
+  # values at a time. Summarising is description, so thinking here is cost.
+  summary_params:
+    max_tokens: 1024
+    reasoning_budget: 0
+    chat_template_kwargs:
+      enable_thinking: false
+
+  # Required once embedding_model is set, with no default. Its output is what a
+  # later search matches against, so it carries the searchable specifics.
+  summary_prompt: |
+    You are indexing one turn of an autonomous operator's transcript so that it
+    can be found again later by meaning. You describe the turn, you do not act
+    on it.
+
+    Write two to four short lines saying what was attempted and what came of
+    it. Lead with the action, then the outcome.
+
+    A turn may include the operator's own reasoning. Use it to say why the
+    action was taken, in a clause, not as a retelling of the thinking.
+
+    Keep the specifics a later search would go looking for, so name commands,
+    paths, package and service names, exit codes, counts, and the wording of
+    any error.
+
+    Write nothing else. No preamble, no heading, no bullet marker, no closing
+    remark, and no guessing at intent beyond what the text shows. If the turn
+    achieved nothing, say that in one line.
