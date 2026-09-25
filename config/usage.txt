@@ -1,0 +1,18 @@
+Usage
+    echo '<goal>' | agent <session-uuid>
+    agent <session-uuid>
+    agent --init
+    agent --help
+
+A goal on stdin starts a session under that UUID. Omit the goal to resume a
+session that already exists, which replays its original goal and carries on.
+Piping a goal at a UUID that already holds a transcript is refused. Any UUID
+will do for a new run, and the kernel hands you one at
+/proc/sys/kernel/random/uuid.
+
+--init writes the example config to $AGENT_CONFIG, or to the user config
+directory when that is unset, and refuses if a file is already there.
+
+Full trust, meaning no sandbox, no denylist and no confirmation prompts.
+
+Configuration is read from that same file.

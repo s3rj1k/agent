@@ -1,0 +1,6 @@
+Search everything you have already done in this run and get back short descriptions of the matching turns.
+Older turns are dropped from what you can still see once the conversation grows, but every one of them stays searchable here, so use this to recover work that has scrolled away.
+Set query to describe what you are looking for in your own words, since the search goes by meaning rather than exact wording.
+Each hit gives you an id, a relevance score from 0 to 1, when it happened in both clock time and age, the size of the original text, and a few lines saying what was attempted and what came of it.
+Set id instead of query to get one entry back in full, including the complete command output as you first saw it.
+Recent turns are still in front of you, so reach for this when you need something older than what you can read.

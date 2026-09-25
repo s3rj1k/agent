@@ -1,0 +1,47 @@
+recall:
+  # The other half of context_fraction above, which sets what stays findable
+  # rather than visible. Its calls obey endpoint.request_delay and max_retries.
+
+  # Empty disables all of it. Set it and every turn plus the goal is summarised
+  # and embedded, costing roughly one completion and one embedding call each.
+  embedding_model: nvidia/nemotron-3-embed-1b
+
+  # Vector size. 0 takes whatever the model returns. Changing it mid session
+  # makes existing rows unsearchable rather than wrong.
+  dimensions: 0
+
+  # Extra fields merged into every embeddings request body. Retrieval models
+  # need to be told they are reading a stored passage rather than a question.
+  embedding_params:
+    input_type: passage
+    truncate: END
+
+  # Merged on top of the above when embedding a search query. Asymmetric models
+  # lose accuracy badly when a question is embedded as though it were a passage.
+  embedding_query_params:
+    input_type: query
+
+  # How many matches a search returns when the model does not ask for a count.
+  # Both this and a count the model asks for are capped at 25.
+  top_k: 5
+
+  # Ceiling on one whole fetch by id, lowered to the context budget when that
+  # is smaller, so pulling an entry back cannot undo the trimming just done.
+  max_fetch_bytes: 65536
+
+  # Model for the summary call. Empty uses endpoint.model. Summarising is far
+  # easier than the main loop, so a small fast model belongs here.
+  summary_model: "openai/gpt-oss-20b"
+
+  # Replaces keys of endpoint.params for the summary call only, whole nested
+  # values at a time. Summarising is description, so thinking here is cost.
+  summary_params:
+    max_tokens: 1024
+    reasoning_budget: 0
+    chat_template_kwargs:
+      enable_thinking: false
+
+  # Required once embedding_model is set, with no default. Its output is what a
+  # later search matches against, so it carries the searchable specifics.
+  summary_prompt: |
+[[ indent 4 .SummaryPrompt ]]

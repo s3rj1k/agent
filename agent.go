@@ -8,7 +8,6 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +16,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -25,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 	"unicode"
 	"uuid"
@@ -39,65 +38,31 @@ import (
 	"github.com/joakimcarlsson/ai/tokens"
 	"github.com/joakimcarlsson/ai/tokens/truncate"
 	"github.com/joakimcarlsson/ai/tool"
-	"github.com/joakimcarlsson/ai/tool/functiontool"
 	yaml "go.yaml.in/yaml/v3"
 	_ "modernc.org/sqlite"
-	_ "modernc.org/sqlite/vec"
 )
-
-const usage = `Usage
-    echo '<goal>' | agent <session-uuid>
-    agent <session-uuid>
-    agent --init
-    agent --help
-
-A goal on stdin starts a session under that UUID. Omit the goal to resume a
-session that already exists, which replays its original goal and carries on.
-Piping a goal at a UUID that already holds a transcript is refused. Any UUID
-will do for a new run, and the kernel hands you one at
-/proc/sys/kernel/random/uuid.
-
---init writes the example config to $AGENT_CONFIG, or to the user config
-directory when that is unset, and refuses if a file is already there.
-
-Full trust, meaning no sandbox, no denylist and no confirmation prompts.
-
-Configuration is read from that same file.
-`
-
-const execToolDescription = `Run one program and get back the exit code with the combined stdout and stderr.
-The command goes through bash -c by default, so set program to python3, node, perl or anything else on PATH when the step is easier to write in that language than to quote through a shell.
-Set program_flag alongside it when that interpreter does not take its program under -c, so -e for node, perl and ruby, where -c means check rather than run.
-Every call is a fresh process, so nothing carries over. Use dir and env rather than cd and export, and in a shell chain dependent steps with &&.
-To write a file, set command to "cat > /path" and put the contents in stdin, which avoids heredoc quoting.
-Input you do not supply reads as EOF, but a command waiting for an interactive answer hangs until killed, so use non-interactive flags.
-A non-zero exit is reported as an error, though grep, diff and test use non-zero normally, so judge by the output too.
-Output is untruncated and stays in your context for the rest of the run, so pipe anything long through head, tail, wc -l or grep.
-For output too large to read, set output_file. Stdout then goes to that file and you get back only a byte count, while stderr is still returned so a failure is still readable. Add append to keep what the file already holds, and mkdir to create its parent directory.`
-
-const rememberToolDescription = `Search everything you have already done in this run and get back short descriptions of the matching turns.
-Older turns are dropped from what you can still see once the conversation grows, but every one of them stays searchable here, so use this to recover work that has scrolled away.
-Set query to describe what you are looking for in your own words, since the search goes by meaning rather than exact wording.
-Each hit gives you an id, a relevance score from 0 to 1, when it happened in both clock time and age, the size of the original text, and a few lines saying what was attempted and what came of it.
-Set id instead of query to get one entry back in full, including the complete command output as you first saw it.
-Recent turns are still in front of you, so reach for this when you need something older than what you can read.`
 
 const (
-	functionType      = "function"
-	maxBackoff        = 5 * time.Minute
-	maxBackoffShift   = 4
-	maxSearchLimit    = 25
-	maxSummaryBytes   = 1000
-	maxTokenizerCost  = 1 << 28
-	rememberTries     = 3
-	retryBackoff      = 30 * time.Second
-	searchHeaderBytes = 160
-	textType          = "text"
-	typeKey           = "type"
+	functionType     = "function"
+	maxBackoff       = 5 * time.Minute
+	maxBackoffShift  = 4
+	maxTokenizerCost = 1 << 28
+	retryBackoff     = 30 * time.Second
+	textType         = "text"
+	typeKey          = "type"
 )
 
-//go:embed agent.yaml
-var exampleConfig string
+//go:embed config/usage.txt
+var defaultUsage string
+
+//go:embed config/agent.yaml.tmpl
+var configTemplate string
+
+//go:embed config/prompts/system-head.txt
+var promptSystemHead string
+
+//go:embed config/prompts/system-tail.txt
+var promptSystemTail string
 
 var errNoGoal = errors.New("no goal recorded in this session")
 
@@ -126,35 +91,17 @@ type BudgetConfig struct {
 	Deadline         duration `yaml:"deadline"`
 }
 
-type ShellConfig struct {
-	Program           string   `yaml:"program"`
-	Dir               string   `yaml:"dir"`
-	CommandTimeout    duration `yaml:"command_timeout"`
-	MaxCommandTimeout duration `yaml:"max_command_timeout"`
-}
-
 type SessionConfig struct {
 	Dir string `yaml:"dir"`
 }
 
-type RememberConfig struct {
-	SummaryParams        map[string]any `yaml:"summary_params"`
-	EmbeddingParams      map[string]any `yaml:"embedding_params"`
-	EmbeddingQueryParams map[string]any `yaml:"embedding_query_params"`
-	EmbeddingModel       string         `yaml:"embedding_model"`
-	SummaryPrompt        string         `yaml:"summary_prompt"`
-	SummaryModel         string         `yaml:"summary_model"`
-	Dimensions           int            `yaml:"dimensions"`
-	TopK                 int            `yaml:"top_k"`
-	MaxFetchBytes        int            `yaml:"max_fetch_bytes"`
-}
-
 type Config struct {
 	SystemPrompt string         `yaml:"system_prompt"`
+	Usage        string         `yaml:"usage"`
 	Session      SessionConfig  `yaml:"session"`
 	Budget       BudgetConfig   `yaml:"budget"`
 	Shell        ShellConfig    `yaml:"shell"`
-	Remember     RememberConfig `yaml:"remember"`
+	Recall       RecallConfig   `yaml:"recall"`
 	Endpoint     EndpointConfig `yaml:"endpoint"`
 }
 
@@ -184,14 +131,6 @@ type chatClient struct {
 	label  string
 	model  llm.Model
 	maxTok int64
-}
-
-type embedder struct {
-	api     *endpointAPI
-	passage map[string]any
-	query   map[string]any
-	model   string
-	dims    int
 }
 
 type chatToolCall struct {
@@ -234,19 +173,6 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
-type execParams struct {
-	Env            map[string]string `json:"env,omitempty" desc:"Extra environment variables for this command, as an object of name to string value. Added to the inherited environment rather than replacing it."`
-	TimeoutSeconds *int              `json:"timeout_seconds,omitempty" desc:"Optional per-command timeout in seconds. Omit to use the default. Values above the configured maximum are clamped."`
-	Command        string            `json:"command" desc:"The program text to run, passed to the interpreter as one argument. Required; must be a non-empty string."`
-	Program        string            `json:"program,omitempty" desc:"Interpreter to run the command with. Defaults to the configured shell. Set it to python3, node, perl or anything else on PATH to write in that language directly rather than quoting it through the shell."`
-	ProgramFlag    string            `json:"program_flag,omitempty" desc:"Flag the interpreter takes its program under. Defaults to -c, which suits sh, bash and python. Use -e for node, perl and ruby, where -c means check rather than run."`
-	Dir            string            `json:"dir,omitempty" desc:"Working directory for this command. A relative path resolves against the agent working directory. Defaults to it when unset."`
-	OutputFile     string            `json:"output_file,omitempty" desc:"Write standard output to this file instead of returning it. Use it when output would be large. A relative path resolves against dir. Standard error is still returned, and the response reports the byte count rather than the content."`
-	Stdin          string            `json:"stdin,omitempty" desc:"Optional data piped to the command's standard input. Use this rather than a heredoc when writing file contents."`
-	Append         bool              `json:"append,omitempty" desc:"Append to output_file instead of truncating it."`
-	Mkdir          bool              `json:"mkdir,omitempty" desc:"Create the parent directory of output_file if it does not exist."`
-}
-
 type window struct {
 	counter  *tokens.Counter
 	trimmer  tokens.Strategy
@@ -259,50 +185,17 @@ type window struct {
 	opened   bool
 }
 
-type execTool struct {
-	echo       io.Writer
-	shell      string
-	dir        string
-	timeout    time.Duration
-	maxTimeout time.Duration
-}
-
-type rememberParams struct {
-	ID    *int64 `json:"id,omitempty" desc:"Return one entry in full instead of searching. Use an id from an earlier search result. Ignores query when set."`
-	Limit *int   `json:"limit,omitempty" desc:"How many matches to return. Omit to use the configured default."`
-	Query string `json:"query,omitempty" desc:"What to look for, described in your own words. Matched by meaning against a short description of every past turn, so a sentence works better than a keyword."`
-}
-
-type rememberIndex struct {
-	db           *sql.DB
-	embedder     *embedder
-	llm          llm.LLM
-	echo         io.Writer
-	open         func()
-	unsummarized map[int64]int
-	sessionID    string
-	prompt       string
-	model        string
-	topK         int
-	maxFetch     int
-	tokens       int64
-}
-
-type rememberPending struct {
-	summary sql.Null[string]
-	id      int64
-	lo, hi  int64
-}
-
-type rememberSession struct {
-	session.Session
-
-	idx *rememberIndex
-}
-
-type rememberStore struct {
-	inner session.Store
-	idx   *rememberIndex
+type recallSetup struct {
+	cfg       *Config
+	db        *sql.DB
+	api       *endpointAPI
+	win       *window
+	out       io.Writer
+	store     session.Store
+	report    func()
+	sessionID string
+	banner    string
+	tools     []tool.BaseTool
 }
 
 func (d *duration) UnmarshalYAML(n *yaml.Node) error {
@@ -706,241 +599,6 @@ func (c *chatClient) SendMessages(
 	}, nil
 }
 
-func (e *embedder) embed(
-	ctx context.Context,
-	texts []string,
-	extra map[string]any,
-) ([][]float32, error) {
-	req := map[string]any{}
-	if e.dims > 0 {
-		req["dimensions"] = e.dims
-	}
-
-	maps.Copy(req, extra)
-
-	req["model"] = e.model
-	req["input"] = texts
-
-	var out struct {
-		Data []struct {
-			Embedding []float32 `json:"embedding"`
-			Index     int       `json:"index"`
-		} `json:"data"`
-	}
-	if err := e.api.call(ctx, "/embeddings", "embed", req, &out); err != nil {
-		return nil, err
-	}
-
-	vecs := make([][]float32, len(out.Data))
-	for _, d := range out.Data {
-		if d.Index < 0 || d.Index >= len(vecs) {
-			return nil, fmt.Errorf("embeddings: index %d out of range", d.Index)
-		}
-
-		vecs[d.Index] = d.Embedding
-	}
-
-	return vecs, nil
-}
-
-func (t *execTool) openOutput(
-	p execParams,
-	dir string,
-) (*os.File, string, int64, error) {
-	path := p.OutputFile
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(dir, path)
-	}
-
-	if p.Mkdir {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, "", 0, fmt.Errorf(
-				"exec: creating directory for %q: %w", path, err)
-		}
-	}
-
-	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	if p.Append {
-		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
-	}
-
-	f, err := os.OpenFile(path, flags, 0o644)
-	if err != nil {
-		return nil, "", 0, fmt.Errorf("exec: opening %q: %w", path, err)
-	}
-
-	var before int64
-
-	if p.Append {
-		if fi, statErr := f.Stat(); statErr == nil {
-			before = fi.Size()
-		}
-	}
-
-	return f, path, before, nil
-}
-
-func (t *execTool) run(ctx context.Context, p execParams) (tool.Response, error) {
-	command := strings.TrimSpace(p.Command)
-	if command == "" {
-		return tool.NewTextErrorResponse(
-			`exec: "command" is required and must be a non-empty string.`,
-		), nil
-	}
-
-	program, flag := cmp.Or(p.Program, t.shell), cmp.Or(p.ProgramFlag, "-c")
-	if _, err := exec.LookPath(program); err != nil {
-		return tool.NewTextErrorResponse(fmt.Sprintf(
-			"exec: program %q is not on PATH: %v", program, err)), nil
-	}
-
-	timeout := t.timeout
-	if p.TimeoutSeconds != nil && *p.TimeoutSeconds > 0 {
-		timeout = min(time.Duration(*p.TimeoutSeconds)*time.Second, t.maxTimeout)
-	}
-
-	banner := command
-	if p.Program != "" {
-		banner = program + " " + flag + "\n" + command
-	}
-
-	_, _ = fmt.Fprintf(t.echo, "$ %s\n", oneBlock(banner))
-
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	dir := t.dir
-	if p.Dir != "" {
-		dir = p.Dir
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(t.dir, dir)
-		}
-	}
-
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		return tool.NewTextErrorResponse(fmt.Sprintf(
-			"exec: dir %q is not a directory", dir)), nil
-	}
-
-	var out, errOut bytes.Buffer
-
-	stdout := io.Writer(&out)
-	written := int64(0)
-
-	before := int64(0)
-
-	outPath := p.OutputFile
-	if outPath != "" {
-		f, path, size, err := t.openOutput(p, dir)
-		if err != nil {
-			return tool.NewTextErrorResponse(err.Error()), nil
-		}
-
-		defer func() { _ = f.Close() }()
-
-		outPath, stdout, before = path, f, size
-	}
-
-	cmd := exec.CommandContext(runCtx, program, flag, command)
-	cmd.Dir = dir
-
-	if len(p.Env) > 0 {
-		env := os.Environ()
-		for _, k := range slices.Sorted(maps.Keys(p.Env)) {
-			env = append(env, k+"="+p.Env[k])
-		}
-
-		cmd.Env = env
-	}
-
-	cmd.Stdin = strings.NewReader(p.Stdin)
-	cmd.Stdout = stdout
-	cmd.Stderr = &out
-
-	if outPath != "" {
-		cmd.Stderr = &errOut
-	}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = 2 * time.Second
-
-	start := time.Now()
-	err := cmd.Run()
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	if cmd.Process != nil &&
-		(runCtx.Err() != nil || errors.Is(err, exec.ErrWaitDelay)) {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-
-	var status string
-
-	failed := true
-
-	switch {
-	case ctx.Err() != nil:
-		status = "killed (run canceled)"
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
-		status = fmt.Sprintf("killed after %s (timeout)", timeout)
-	case err == nil:
-		status, failed = "0", false
-	case errors.Is(err, exec.ErrWaitDelay):
-		code := -1
-		if cmd.ProcessState != nil {
-			code = cmd.ProcessState.ExitCode()
-		}
-
-		failed = code != 0
-		status = fmt.Sprintf(
-			"%d (exited, but background processes held the output open "+
-				"and were killed)", code)
-	default:
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			status = strconv.Itoa(exitErr.ExitCode())
-		} else {
-			status = fmt.Sprintf("failed to start: %v", err)
-		}
-	}
-
-	body := fmt.Sprintf("exit_code: %s\nduration: %s\n", status, elapsed)
-
-	if outPath != "" {
-		if fi, statErr := os.Stat(outPath); statErr == nil {
-			written = fi.Size() - before
-		}
-
-		body += fmt.Sprintf("wrote %d bytes of stdout to %s\n", written, outPath)
-
-		text := "(no stderr)"
-		if errOut.Len() > 0 {
-			text = strings.ToValidUTF8(errOut.String(), "�")
-		}
-
-		body += "--- stderr ---\n" + text
-
-		if failed {
-			return tool.NewTextErrorResponse(body), nil
-		}
-
-		return tool.NewTextResponse(body), nil
-	}
-
-	text := "(no output)"
-	if out.Len() > 0 {
-		text = strings.ToValidUTF8(out.String(), "�")
-	}
-
-	body += "--- stdout+stderr (combined) ---\n" + text
-	if failed {
-		return tool.NewTextErrorResponse(body), nil
-	}
-
-	return tool.NewTextResponse(body), nil
-}
-
 func (w *window) tokenizerCost(s string) int64 {
 	var total, run int64
 
@@ -1027,14 +685,6 @@ func (w *window) openTurn() {
 	}
 }
 
-func (w *window) first() {
-	if w.turn == 0 {
-		w.openTurn()
-
-		w.opened = true
-	}
-}
-
 func (w *window) preModelCall(
 	ctx context.Context,
 	mc agent.ModelCallContext,
@@ -1082,608 +732,6 @@ func (w *window) preModelCall(
 	}, nil
 }
 
-func (x *rememberIndex) text(msgs []message.Message) string {
-	var b strings.Builder
-
-	for i := range msgs {
-		m := &msgs[i]
-		for _, part := range m.Parts {
-			switch c := part.(type) {
-			case message.TextContent:
-				if t := strings.TrimSpace(c.Text); t != "" {
-					b.WriteString(string(m.Role) + ": " + t + "\n")
-				}
-			case message.ReasoningContent:
-				if t := strings.TrimSpace(c.Text); t != "" {
-					b.WriteString("reasoning: " + t + "\n")
-				}
-			case message.ToolCall:
-				b.WriteString("called " + c.Name + " with " + c.Input + "\n")
-			case message.ToolResult:
-				verb := "result of "
-				if c.IsError {
-					verb = "failed result of "
-				}
-
-				b.WriteString(verb + c.Name + "\n" + c.Content + "\n")
-
-				if md := strings.TrimSpace(c.Metadata); md != "" {
-					b.WriteString("metadata: " + md + "\n")
-				}
-			case message.ImageURLContent:
-				b.WriteString("image: " + c.URL + " " + c.Detail + "\n")
-			case message.BinaryContent:
-				fmt.Fprintf(&b, "binary: %s %s %d bytes\n",
-					c.Path, c.MIMEType, len(c.Data))
-			default:
-				fmt.Fprintf(&b, "part: %T\n", c)
-			}
-		}
-	}
-
-	return strings.TrimSpace(b.String())
-}
-
-func (x *rememberIndex) maxID(ctx context.Context) int64 {
-	var id sql.Null[int64]
-	if err := x.db.QueryRowContext(ctx,
-		`SELECT MAX(id) FROM messages WHERE session_id = ?`,
-		x.sessionID).Scan(&id); err != nil {
-		return 0
-	}
-
-	return id.V
-}
-
-func (x *rememberIndex) body(
-	ctx context.Context,
-	lo, hi int64,
-) (string, error) {
-	rows, err := x.db.QueryContext(ctx, `SELECT parts FROM messages
-		WHERE session_id = ? AND id BETWEEN ? AND ? ORDER BY id`,
-		x.sessionID, lo, hi)
-	if err != nil {
-		return "", err
-	}
-
-	defer func() { _ = rows.Close() }()
-
-	var msgs []message.Message
-
-	for rows.Next() {
-		var blob string
-		if err := rows.Scan(&blob); err != nil {
-			return "", err
-		}
-
-		var m message.Message
-		if err := json.Unmarshal([]byte(blob), &m); err != nil {
-			continue
-		}
-
-		msgs = append(msgs, m)
-	}
-
-	return x.text(msgs), rows.Err()
-}
-
-func (x *rememberIndex) brief(s string) string {
-	if len(s) <= maxSummaryBytes {
-		return s
-	}
-
-	return strings.ToValidUTF8(s[:maxSummaryBytes], "")
-}
-
-func (x *rememberIndex) summarize(
-	ctx context.Context,
-	body string,
-) (string, error) {
-	const head, tail = 8000, 8000
-
-	if len(body) > head+tail {
-		body = strings.ToValidUTF8(body[:head], "") + "\n[...]\n" +
-			strings.ToValidUTF8(body[len(body)-tail:], "")
-	}
-
-	resp, err := x.llm.SendMessages(ctx, []message.Message{
-		message.NewSystemMessage(x.prompt),
-		message.NewUserMessage(body),
-	}, nil)
-	if err != nil {
-		return "", err
-	}
-
-	x.tokens += resp.Usage.InputTokens + resp.Usage.OutputTokens
-
-	s := strings.TrimSpace(resp.Content)
-	if s == "" {
-		return "", errors.New("model returned an empty summary")
-	}
-
-	return x.brief(s), nil
-}
-
-func (x *rememberIndex) embed(
-	ctx context.Context,
-	texts []string,
-	extra map[string]any,
-) ([][]float32, error) {
-	vecs, err := x.embedder.embed(ctx, texts, extra)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(vecs) != len(texts) {
-		return nil, fmt.Errorf("got %d vectors for %d inputs",
-			len(vecs), len(texts))
-	}
-
-	return vecs, nil
-}
-
-func (x *rememberIndex) embedPassage(
-	ctx context.Context,
-	texts []string,
-) ([][]float32, error) {
-	return x.embed(ctx, texts, x.embedder.passage)
-}
-
-func (x *rememberIndex) embedQuery(
-	ctx context.Context,
-	texts []string,
-) ([][]float32, error) {
-	return x.embed(ctx, texts, x.embedder.query)
-}
-
-func (x *rememberIndex) counts(ctx context.Context) (total, ready int) {
-	_ = x.db.QueryRowContext(ctx,
-		`SELECT count(*), coalesce(sum(vector IS NOT NULL AND model = ?), 0)
-		FROM remember WHERE session_id = ?`,
-		x.model, x.sessionID).Scan(&total, &ready)
-
-	return total, ready
-}
-
-func (x *rememberIndex) pending(
-	ctx context.Context,
-) ([]rememberPending, error) {
-	rows, err := x.db.QueryContext(ctx,
-		`SELECT id, lo_id, hi_id, summary FROM remember
-		WHERE session_id = ? AND vector IS NULL ORDER BY id`, x.sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() { _ = rows.Close() }()
-
-	var todo []rememberPending
-
-	for rows.Next() {
-		var p rememberPending
-		if err := rows.Scan(&p.id, &p.lo, &p.hi, &p.summary); err != nil {
-			return nil, err
-		}
-
-		todo = append(todo, p)
-	}
-
-	return todo, rows.Err()
-}
-
-func (x *rememberIndex) fill(ctx context.Context) {
-	save := context.WithoutCancel(ctx)
-
-	todo, listErr := x.pending(ctx)
-	if listErr != nil {
-		_, _ = fmt.Fprintf(x.echo, "[remember] %v\n", listErr)
-
-		return
-	}
-
-	var (
-		ids       []int64
-		summaries []string
-	)
-
-	for _, p := range todo {
-		if p.summary.Valid {
-			ids = append(ids, p.id)
-			summaries = append(summaries, p.summary.V)
-
-			continue
-		}
-
-		if x.unsummarized[p.id] >= rememberTries {
-			continue
-		}
-
-		body, err := x.body(ctx, p.lo, p.hi)
-		if err != nil || body == "" {
-			continue
-		}
-
-		s, err := x.summarize(ctx, body)
-		if err != nil {
-			x.unsummarized[p.id]++
-
-			_, _ = fmt.Fprintf(x.echo, "[remember] summary failed: %v\n", err)
-
-			continue
-		}
-
-		if _, err := x.db.ExecContext(save,
-			`UPDATE remember SET summary = ? WHERE id = ?`, s, p.id); err != nil {
-			_, _ = fmt.Fprintf(x.echo, "[remember] %v\n", err)
-			continue
-		}
-
-		ids = append(ids, p.id)
-		summaries = append(summaries, s)
-	}
-
-	if len(ids) == 0 {
-		return
-	}
-
-	vecs, err := x.embedPassage(ctx, summaries)
-	if err != nil {
-		_, _ = fmt.Fprintf(x.echo, "[remember] embedding failed: %v\n", err)
-		return
-	}
-
-	for i, id := range ids {
-		blob, err := binary.Append(nil, binary.LittleEndian, vecs[i])
-		if err != nil {
-			_, _ = fmt.Fprintf(x.echo, "[remember] %v\n", err)
-			continue
-		}
-
-		if _, err := x.db.ExecContext(save, `UPDATE remember
-			SET summary = ?, vector = ?, dims = ?, model = ? WHERE id = ?`,
-			summaries[i], blob, len(vecs[i]), x.model, id); err != nil {
-			_, _ = fmt.Fprintf(x.echo, "[remember] %v\n", err)
-		}
-	}
-}
-
-func (x *rememberIndex) add(
-	ctx context.Context,
-	msgs []message.Message,
-	lo, hi int64,
-) {
-	calls, mine := 0, 0
-
-	for i := range msgs {
-		for _, c := range msgs[i].ToolCalls() {
-			calls++
-
-			if c.Name == "remember" {
-				mine++
-			}
-		}
-	}
-
-	if calls > 0 && calls == mine {
-		return
-	}
-
-	body := x.text(msgs)
-	if body == "" {
-		return
-	}
-
-	if _, err := x.db.ExecContext(ctx, `INSERT INTO remember
-		(session_id, lo_id, hi_id, bytes, created_at, model, dims)
-		VALUES (?, ?, ?, ?, ?, ?, 0)`,
-		x.sessionID, lo, hi, len(body), time.Now().UnixNano(),
-		x.model); err != nil {
-		_, _ = fmt.Fprintf(x.echo, "[remember] %v\n", err)
-
-		return
-	}
-
-	x.fill(ctx)
-}
-
-func (x *rememberIndex) search(
-	ctx context.Context,
-	query string,
-	limit int,
-) (string, error) {
-	vecs, err := x.embedQuery(ctx, []string{query})
-	if err != nil {
-		return "", err
-	}
-
-	q, err := binary.Append(nil, binary.LittleEndian, vecs[0])
-	if err != nil {
-		return "", err
-	}
-
-	rows, err := x.db.QueryContext(ctx,
-		`SELECT id, created_at, bytes, summary,
-			coalesce(1 - vec_distance_cosine(vector, ?), 0) AS score
-		FROM remember
-		WHERE session_id = ? AND model = ? AND dims = ? AND vector IS NOT NULL
-		ORDER BY score DESC, created_at DESC
-		LIMIT ?`,
-		q, x.sessionID, x.model, len(vecs[0]), limit)
-	if err != nil {
-		return "", err
-	}
-
-	defer func() { _ = rows.Close() }()
-
-	type hit struct {
-		summary string
-		score   float64
-		id      int64
-		at      int64
-		size    int64
-	}
-
-	hits := make([]hit, 0, limit)
-
-	for rows.Next() {
-		var h hit
-		if err := rows.Scan(
-			&h.id, &h.at, &h.size, &h.summary, &h.score); err != nil {
-			return "", err
-		}
-
-		hits = append(hits, h)
-	}
-
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-
-	if len(hits) == 0 {
-		total, ready := x.counts(ctx)
-
-		switch {
-		case total == 0:
-			return "Nothing has been indexed for this session yet.", nil
-		case ready == 0:
-			return "Nothing has been embedded with the current model yet, " +
-				"so there is nothing to match against.", nil
-		default:
-			return "No embedded entry matches the vector size in use now.", nil
-		}
-	}
-
-	now := time.Now()
-	room := x.maxFetch - searchHeaderBytes
-
-	var (
-		entries []string
-		used    int
-	)
-
-	for _, h := range hits {
-		at := time.Unix(0, h.at)
-		e := fmt.Sprintf("\n[%d] %.2f | %s | %s ago | %d bytes\n%s\n",
-			h.id, h.score, at.Format(time.DateTime),
-			now.Sub(at).Round(time.Second), h.size, x.brief(h.summary))
-
-		if len(entries) > 0 && used+len(e) > room {
-			break
-		}
-
-		entries = append(entries, e)
-		used += len(e)
-	}
-
-	var out strings.Builder
-	if len(entries) < len(hits) {
-		fmt.Fprintf(&out, "Showing %d of %d matches, most relevant first. "+
-			"Narrow the query or lower limit to see the rest. "+
-			"Pass id to get one back in full.\n", len(entries), len(hits))
-	} else {
-		fmt.Fprintf(&out, "%d matches, most relevant first. "+
-			"Pass id to get one back in full.\n", len(hits))
-	}
-
-	for _, e := range entries {
-		out.WriteString(e)
-	}
-
-	return strings.TrimSpace(out.String()), nil
-}
-
-func (x *rememberIndex) affordable(fixed, s string) string {
-	var total, run int64
-
-	for _, r := range fixed {
-		if unicode.IsSpace(r) {
-			total += run * run
-			run = 0
-
-			continue
-		}
-
-		run++
-	}
-
-	total += run * run
-	run = 0
-
-	for i, r := range s {
-		if unicode.IsSpace(r) {
-			total += run * run
-			run = 0
-
-			continue
-		}
-
-		run++
-
-		if total+run*run >= maxTokenizerCost {
-			return s[:i]
-		}
-	}
-
-	return s
-}
-
-func (x *rememberIndex) fetch(
-	ctx context.Context,
-	id int64,
-) (string, error) {
-	var (
-		lo, hi, at int64
-		summary    sql.Null[string]
-	)
-
-	if err := x.db.QueryRowContext(ctx,
-		`SELECT lo_id, hi_id, created_at, summary FROM remember
-		WHERE id = ? AND session_id = ?`, id, x.sessionID).
-		Scan(&lo, &hi, &at, &summary); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("no entry with id %d in this session", id)
-		}
-
-		return "", err
-	}
-
-	body, err := x.body(ctx, lo, hi)
-	if err != nil {
-		return "", err
-	}
-
-	when := time.Unix(0, at)
-	out := fmt.Sprintf("[%d] %s | %s ago | %d bytes\n%s\n\n",
-		id, when.Format(time.DateTime), time.Since(when).Round(time.Second),
-		len(body), x.brief(summary.V))
-
-	if len(out) >= x.maxFetch {
-		return fmt.Sprintf("Entry %d is %d bytes and its description alone "+
-			"exceeds max_fetch_bytes of %d, so none of it can be returned. "+
-			"Raise max_fetch_bytes or widen the context window.",
-			id, len(body), x.maxFetch), nil
-	}
-
-	room := x.maxFetch - len(out)
-
-	cut := body
-	if len(cut) > room {
-		cut = strings.ToValidUTF8(cut[:room], "")
-	}
-
-	cut = x.affordable(out+fmt.Sprintf(
-		"\n[truncated at %d of %d bytes]", len(body), len(body)), cut)
-
-	if len(cut) == len(body) {
-		return out + body, nil
-	}
-
-	trailer := fmt.Sprintf("\n[truncated at %d of %d bytes]", len(cut), len(body))
-
-	if over := len(cut) + len(trailer) - room; over > 0 {
-		cut = strings.ToValidUTF8(cut[:max(len(cut)-over, 0)], "")
-		trailer = fmt.Sprintf(
-			"\n[truncated at %d of %d bytes]", len(cut), len(body))
-	}
-
-	return out + cut + trailer, nil
-}
-
-func (x *rememberIndex) remember(
-	ctx context.Context,
-	p rememberParams,
-) (tool.Response, error) {
-	if p.ID != nil {
-		out, err := x.fetch(ctx, *p.ID)
-		if err != nil {
-			return tool.NewTextErrorResponse(
-				fmt.Sprintf("remember: %v", err)), nil
-		}
-
-		return tool.NewTextResponse(out), nil
-	}
-
-	query := strings.TrimSpace(p.Query)
-	if query == "" {
-		return tool.NewTextErrorResponse(
-			`remember: set "query" to search, or "id" to fetch one entry.`), nil
-	}
-
-	limit := x.topK
-	if p.Limit != nil && *p.Limit > 0 {
-		limit = min(*p.Limit, maxSearchLimit)
-	}
-
-	out, err := x.search(ctx, query, limit)
-	if err != nil {
-		return tool.NewTextErrorResponse(
-			fmt.Sprintf("remember: %v", err)), nil
-	}
-
-	return tool.NewTextResponse(out), nil
-}
-
-func (s *rememberSession) AddMessages(
-	ctx context.Context,
-	msgs []message.Message,
-) error {
-	if s.idx.open != nil {
-		s.idx.open()
-	}
-
-	lo := s.idx.maxID(ctx) + 1
-
-	if err := s.Session.AddMessages(ctx, msgs); err != nil {
-		return err
-	}
-
-	if hi := s.idx.maxID(ctx); hi >= lo {
-		s.idx.add(ctx, msgs, lo, hi)
-	}
-
-	return nil
-}
-
-func (s *rememberStore) Exists(
-	ctx context.Context,
-	id string,
-) (bool, error) {
-	return s.inner.Exists(ctx, id)
-}
-
-func (s *rememberStore) Create(
-	ctx context.Context,
-	id string,
-) (session.Session, error) {
-	inner, err := s.inner.Create(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	return &rememberSession{Session: inner, idx: s.idx}, nil
-}
-
-func (s *rememberStore) Load(
-	ctx context.Context,
-	id string,
-) (session.Session, error) {
-	inner, err := s.inner.Load(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	return &rememberSession{Session: inner, idx: s.idx}, nil
-}
-
-func (s *rememberStore) Delete(ctx context.Context, id string) error {
-	if _, err := s.idx.db.ExecContext(ctx,
-		`DELETE FROM remember WHERE session_id = ?`, id); err != nil {
-		_, _ = fmt.Fprintf(s.idx.echo, "[remember] %v\n", err)
-	}
-
-	return s.inner.Delete(ctx, id)
-}
-
 func configPath() (string, error) {
 	if path := os.Getenv("AGENT_CONFIG"); path != "" {
 		return path, nil
@@ -1709,13 +757,8 @@ func LoadConfig() (Config, string, error) {
 		Budget: BudgetConfig{
 			MaxIterations: 200,
 		},
+		Usage:   defaultUsage,
 		Session: SessionConfig{Dir: ".agent"},
-		Shell: ShellConfig{
-			Program:           "/bin/bash",
-			CommandTimeout:    duration(2 * time.Minute),
-			MaxCommandTimeout: duration(15 * time.Minute),
-		},
-		Remember: RememberConfig{TopK: 5, MaxFetchBytes: 65536},
 	}
 	cfg := defaults
 
@@ -1758,18 +801,9 @@ func LoadConfig() (Config, string, error) {
 		cfg.Budget.MaxIterations = defaults.Budget.MaxIterations
 	}
 
+	cfg.Usage = cmp.Or(cfg.Usage, defaults.Usage)
+
 	cfg.Session.Dir = cmp.Or(cfg.Session.Dir, defaults.Session.Dir)
-
-	cfg.Shell.Program = cmp.Or(cfg.Shell.Program, defaults.Shell.Program)
-	if cfg.Shell.CommandTimeout <= 0 {
-		cfg.Shell.CommandTimeout = defaults.Shell.CommandTimeout
-	}
-
-	if cfg.Shell.MaxCommandTimeout <= 0 {
-		cfg.Shell.MaxCommandTimeout = defaults.Shell.MaxCommandTimeout
-	}
-
-	cfg.Shell.MaxCommandTimeout = max(cfg.Shell.MaxCommandTimeout, cfg.Shell.CommandTimeout)
 
 	if raw := cfg.Endpoint.APIKey; envReference.MatchString(raw) {
 		if cfg.Endpoint.APIKey = os.ExpandEnv(raw); cfg.Endpoint.APIKey == "" {
@@ -1779,20 +813,6 @@ func LoadConfig() (Config, string, error) {
 					"an endpoint that wants no auth", path, raw)
 		}
 	}
-
-	cfg.Remember.Dimensions = max(cfg.Remember.Dimensions, 0)
-	if cfg.Remember.TopK < 1 {
-		cfg.Remember.TopK = defaults.Remember.TopK
-	}
-
-	cfg.Remember.TopK = min(cfg.Remember.TopK, maxSearchLimit)
-
-	if cfg.Remember.MaxFetchBytes < 1 {
-		cfg.Remember.MaxFetchBytes = defaults.Remember.MaxFetchBytes
-	}
-
-	cfg.Remember.MaxFetchBytes = min(cfg.Remember.MaxFetchBytes,
-		int(float64(cfg.Endpoint.ContextWindow)*cfg.Endpoint.ContextFraction))
 
 	if u, err := url.Parse(cfg.Endpoint.BaseURL); err != nil ||
 		u.Scheme == "" || u.Host == "" {
@@ -1809,43 +829,94 @@ func LoadConfig() (Config, string, error) {
 		return cfg, path, fmt.Errorf("%s: budget.exhausted_message is required", path)
 	}
 
-	if _, err := exec.LookPath(cfg.Shell.Program); err != nil {
-		return cfg, path, fmt.Errorf("%s: shell.program %q: %w",
-			path, cfg.Shell.Program, err)
+	if err := normalizeShell(&cfg, path); err != nil {
+		return cfg, path, err
 	}
 
-	if cfg.Shell.Dir != "" {
-		if fi, err := os.Stat(cfg.Shell.Dir); err != nil || !fi.IsDir() {
-			return cfg, path, fmt.Errorf("%s: shell.dir %q is not a directory",
-				path, cfg.Shell.Dir)
-		}
-	}
-
-	if cfg.Remember.EmbeddingModel != "" && cfg.Remember.SummaryPrompt == "" {
-		return cfg, path, fmt.Errorf("%s: remember.summary_prompt is "+
-			"required when remember.embedding_model is set", path)
+	if err := normalizeRecall(&cfg, path); err != nil {
+		return cfg, path, err
 	}
 
 	return cfg, path, nil
 }
 
-func printHelp(out io.Writer) {
-	_, _ = fmt.Fprint(out, usage)
+func printHelp(out io.Writer, text string) {
+	_, _ = fmt.Fprint(out, text)
 
-	path, err := configPath()
-	if err != nil {
+	if path, err := configPath(); err != nil {
 		_, _ = fmt.Fprintf(out,
 			"\nThe config location could not be resolved, %v\n", err)
+	} else {
+		state := "does not exist yet, so run agent --init"
+		if _, err := os.Stat(path); err == nil {
+			state = "already exists"
+		}
 
-		return
+		_, _ = fmt.Fprintf(out, "\nConfig file\n    %s (%s)\n", path, state)
 	}
 
-	state := "does not exist yet, so run agent --init"
-	if _, err := os.Stat(path); err == nil {
-		state = "already exists"
+	_, _ = fmt.Fprintf(out, "\nRecall, the search over your own past turns\n"+
+		"    %s\n", recallHelp)
+}
+
+func indent(n int, s string) string {
+	pad := strings.Repeat(" ", n)
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+
+	for i, l := range lines {
+		if l != "" {
+			lines[i] = pad + l
+		}
 	}
 
-	_, _ = fmt.Fprintf(out, "\nConfig file\n    %s (%s)\n", path, state)
+	return strings.Join(lines, "\n")
+}
+
+func renderConfig(name, src string, vars map[string]string) (string, error) {
+	t, err := template.New(name).Delims("[[", "]]").
+		Funcs(template.FuncMap{"indent": indent}).Parse(src)
+	if err != nil {
+		return "", fmt.Errorf("%s template: %w", name, err)
+	}
+
+	var b strings.Builder
+	if err := t.Execute(&b, vars); err != nil {
+		return "", fmt.Errorf("%s template: %w", name, err)
+	}
+
+	return strings.TrimSpace(b.String()) + "\n", nil
+}
+
+func systemPrompt() string {
+	parts := make([]string, 0, 3)
+
+	for _, p := range []string{
+		promptSystemHead, promptSystemRecall, promptSystemTail,
+	} {
+		if t := strings.TrimSpace(p); t != "" {
+			parts = append(parts, t)
+		}
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+func exampleConfig() (string, error) {
+	shell, err := shellSection()
+	if err != nil {
+		return "", err
+	}
+
+	recall, err := recallSection()
+	if err != nil {
+		return "", err
+	}
+
+	return renderConfig("config", configTemplate, map[string]string{
+		"SystemPrompt": systemPrompt(),
+		"Shell":        strings.TrimSpace(shell),
+		"Recall":       strings.TrimSpace(recall),
+	})
 }
 
 func initConfig(out io.Writer) int {
@@ -1863,13 +934,20 @@ func initConfig(out io.Writer) int {
 		return 1
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	content, err := exampleConfig()
+	if err != nil {
 		_, _ = fmt.Fprintf(out, "agent: %v\n", err)
 
 		return 1
 	}
 
-	if err := os.WriteFile(path, []byte(exampleConfig), 0o600); err != nil {
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		_, _ = fmt.Fprintf(out, "agent: %v\n", err)
+
+		return 1
+	}
+
+	if err = os.WriteFile(path, []byte(content), 0o600); err != nil {
 		_, _ = fmt.Fprintf(out, "agent: %v\n", err)
 
 		return 1
@@ -2055,66 +1133,17 @@ func budgetProvider(
 	}
 }
 
-func newRememberIndex(
-	ctx context.Context,
-	cfg *Config,
-	db *sql.DB,
-	client llm.LLM,
-	api *endpointAPI,
-	sessionID string,
-	out io.Writer,
-) (*rememberIndex, error) {
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS remember (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id TEXT    NOT NULL,
-			lo_id      INTEGER NOT NULL,
-			hi_id      INTEGER NOT NULL,
-			bytes      INTEGER NOT NULL,
-			created_at INTEGER NOT NULL,
-			model      TEXT    NOT NULL,
-			dims       INTEGER NOT NULL,
-			summary    TEXT,
-			vector     BLOB
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_remember_session
-			ON remember(session_id, id)`,
-	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, err
-		}
-	}
-
-	query := map[string]any{}
-	maps.Copy(query, cfg.Remember.EmbeddingParams)
-	maps.Copy(query, cfg.Remember.EmbeddingQueryParams)
-
-	return &rememberIndex{
-		db: db,
-		embedder: &embedder{
-			api:     api,
-			model:   cfg.Remember.EmbeddingModel,
-			passage: cfg.Remember.EmbeddingParams,
-			query:   query,
-			dims:    cfg.Remember.Dimensions,
-		},
-		llm:          client,
-		echo:         out,
-		unsummarized: map[int64]int{},
-		sessionID:    sessionID,
-		prompt:       cfg.Remember.SummaryPrompt,
-		model:        cfg.Remember.EmbeddingModel,
-		topK:         cfg.Remember.TopK,
-		maxFetch:     cfg.Remember.MaxFetchBytes,
-	}, nil
-}
-
 func run() int {
 	args := os.Args[1:]
+
+	cfg, path, cfgErr := LoadConfig()
+
+	usage := cmp.Or(cfg.Usage, defaultUsage)
+
 	if len(args) == 1 {
 		switch {
 		case slices.Contains([]string{"-h", "--help", "help"}, args[0]):
-			printHelp(os.Stderr)
+			printHelp(os.Stderr, usage)
 
 			return 0
 		case args[0] == "--init":
@@ -2130,9 +1159,8 @@ func run() int {
 		return 1
 	}
 
-	cfg, path, err := LoadConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
+	if cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "agent: %v\n", cfgErr)
 		return 1
 	}
 
@@ -2149,11 +1177,6 @@ func run() int {
 			sessionID, cfg.Session.Dir, sessionID)
 
 		return 1
-	}
-
-	workDir := cfg.Shell.Dir
-	if workDir == "" {
-		workDir, _ = os.Getwd()
 	}
 
 	ctx, stop := signal.NotifyContext(
@@ -2211,15 +1234,7 @@ func run() int {
 		maxTurns: cfg.Budget.MaxIterations,
 	}
 
-	tools := []tool.BaseTool{
-		functiontool.New("exec", execToolDescription, (&execTool{
-			shell:      cfg.Shell.Program,
-			dir:        workDir,
-			timeout:    time.Duration(cfg.Shell.CommandTimeout),
-			maxTimeout: time.Duration(cfg.Shell.MaxCommandTimeout),
-			echo:       os.Stderr,
-		}).run),
-	}
+	tools := []tool.BaseTool{newExecTool(&cfg, os.Stderr)}
 
 	opts := []agent.Option{
 		agent.WithSequentialToolExecution(),
@@ -2302,44 +1317,32 @@ func run() int {
 		goal = recorded
 	}
 
-	var idx *rememberIndex
+	rc := &recallSetup{
+		cfg:       &cfg,
+		db:        db,
+		api:       api,
+		win:       w,
+		out:       os.Stderr,
+		store:     store,
+		tools:     tools,
+		sessionID: sessionID,
+	}
 
-	if cfg.Remember.EmbeddingModel != "" {
-		sp := map[string]any{}
-		maps.Copy(sp, cfg.Endpoint.Params)
-		maps.Copy(sp, cfg.Remember.SummaryParams)
-
-		summarizer, _ := newClient(&cfg, api, "summary",
-			cmp.Or(cfg.Remember.SummaryModel, cfg.Endpoint.Model), sp)
-
-		idx, err = newRememberIndex(
-			ctx, &cfg, db, summarizer, api, sessionID, os.Stderr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "agent: remember: %v\n", err)
-			return 1
-		}
-
-		idx.open = w.first
-		store = &rememberStore{inner: store, idx: idx}
-		tools = append(tools, functiontool.New(
-			"remember", rememberToolDescription, idx.remember))
+	if err = rc.install(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "agent: recall: %v\n", err)
+		return 1
 	}
 
 	opts = append(opts,
-		agent.WithTools(tools...),
-		agent.WithSession(sessionID, store))
+		agent.WithTools(rc.tools...),
+		agent.WithSession(sessionID, rc.store))
 
 	mode := ""
 	if !hasGoal {
 		mode = " (resumed)"
 	}
 
-	models := "model: " + model.APIModel
-	if cfg.Remember.EmbeddingModel != "" {
-		models += fmt.Sprintf("  summary: %s  embed: %s",
-			cmp.Or(cfg.Remember.SummaryModel, cfg.Endpoint.Model),
-			cfg.Remember.EmbeddingModel)
-	}
+	models := "model: " + model.APIModel + rc.banner
 
 	fmt.Fprintf(os.Stderr,
 		"config: %s\nendpoint: %s  context: %d of %d  budget: %d\n%s\n"+
@@ -2379,12 +1382,8 @@ func run() int {
 		fmt.Fprintf(os.Stderr, ", %d msgs trimmed", w.dropped)
 	}
 
-	if idx != nil {
-		total, ready := idx.counts(context.Background())
-
-		fmt.Fprintf(os.Stderr,
-			" | remember %d of %d rows embedded, %d summary tokens",
-			ready, total, idx.tokens)
+	if rc.report != nil {
+		rc.report()
 	}
 
 	if pace.waits > 0 {

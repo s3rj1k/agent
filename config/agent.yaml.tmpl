@@ -1,0 +1,84 @@
+# Required. Read from $AGENT_CONFIG, else $XDG_CONFIG_HOME or ~/.config under
+# agent/config.yaml. Unknown keys are rejected, so a typo fails at startup.
+
+# One key is absent here on purpose. A usage block replaces what --help prints
+# and what a bad invocation shows, and then stays frozen as the binary moves on.
+
+# Sent verbatim and never templated, so braces are safe. Your tools describe
+# themselves, so this covers how to work rather than how to call them.
+system_prompt: |
+[[ indent 2 .SystemPrompt ]]
+
+endpoint:
+  # Any server speaking the OpenAI Chat Completions API, so Ollama, vLLM,
+  # llama.cpp and OpenRouter all work here. Include the version path.
+  base_url: https://integrate.api.nvidia.com/v1
+
+  # Generate a NIM key at https://build.nvidia.com/settings/api-keys
+  # A whole-value ${VAR} expands and must resolve. Use "" to send no auth.
+  api_key: ${NVIDIA_API_KEY}
+
+  # Whatever model id the endpoint accepts.
+  model: nvidia/nemotron-3.5-lightning-30b-a3b
+
+  # Nothing can discover this for an arbitrary endpoint, so set it to match
+  # the model. Anything under 4096 is ignored and the default is used instead.
+  context_window: 131072
+
+  # Trim point as a fraction of context_window. Past it the oldest messages are
+  # dropped from the request, though the system prompt and the goal are pinned.
+  context_fraction: 0.75
+
+  # Sent as max_completion_tokens. 0 omits it, which is what endpoints wanting
+  # the older max_tokens spelling need, so set that under params instead.
+  max_tokens: 0
+
+  # Ceiling on one endpoint call, covering every retry and backoff rather than
+  # each attempt. 0s means none. A deadline under 30s leaves no room to retry.
+  request_timeout: 0
+
+  # Retries per request on 408, 409, 429 and any 5xx, whatever the request is
+  # for. Waits double from 30s to a 5m cap, which caps Retry-After.
+  max_retries: 3
+
+  # Minimum gap between requests of every kind. 0s disables. 1.6s keeps a run
+  # under a 40 per minute limit.
+  request_delay: 1.6s
+
+  # Extra HTTP headers, for endpoints behind a gateway.
+  headers: {}
+
+  # Extra fields merged into the chat request body. model, messages and stream
+  # always win, and tool related keys are dropped from the toolless summary.
+  params:
+    temperature: 1
+    top_p: 0.95
+    max_tokens: 16384
+    reasoning_budget: 8192
+    chat_template_kwargs:
+      enable_thinking: true
+
+budget:
+  # The loop is otherwise unbounded. max_iterations is a hard ceiling, checked
+  # after every iteration and shown on each turn line.
+  max_iterations: 200
+
+  # Wall clock limit for the whole run. 0s means none. With under 30s left,
+  # retries stop early rather than sleeping past it.
+  deadline: 0s
+
+  # Required with no default. Go template sent to the model when the ceiling is
+  # hit. Fields are .TotalIterations .MaxIterations .PendingToolCalls.
+  exhausted_message: >-
+    Step budget exhausted after {{.TotalIterations}} of {{.MaxIterations}}
+    shell iterations. No further commands will run. Report what you
+    accomplished, the evidence it worked, and what remains unfinished.
+
+[[ .Shell ]]
+
+session:
+  # Holds one <session-uuid>.db per conversation. A relative path resolves
+  # against the agent's own directory rather than shell.dir.
+  dir: ".agent"
+
+[[ .Recall ]]

@@ -1,0 +1,9 @@
+Run one program and get back the exit code with the combined stdout and stderr.
+The command goes through bash -c by default, so set program to python3, node, perl or anything else on PATH when the step is easier to write in that language than to quote through a shell.
+Set program_flag alongside it when that interpreter does not take its program under -c, so -e for node, perl and ruby, where -c means check rather than run.
+Every call is a fresh process, so nothing carries over. Use dir and env rather than cd and export, and in a shell chain dependent steps with &&.
+To write a file, set command to "cat > /path" and put the contents in stdin, which avoids heredoc quoting.
+Input you do not supply reads as EOF, but a command waiting for an interactive answer hangs until killed, so use non-interactive flags.
+A non-zero exit is reported as an error, though grep, diff and test use non-zero normally, so judge by the output too.
+Output is untruncated and stays in your context for the rest of the run, so pipe anything long through head, tail, wc -l or grep.
+For output too large to read, set output_file. Stdout then goes to that file and you get back only a byte count, while stderr is still returned so a failure is still readable. Add append to keep what the file already holds, and mkdir to create its parent directory.

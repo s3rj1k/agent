@@ -1,0 +1,12 @@
+shell:
+  # The default interpreter, run as <program> -c '<command>'. Empty means
+  # /bin/bash. The model can name a different one per call, so python3 or node.
+  program: /bin/bash
+
+  # Working directory for commands. Empty means the current one.
+  dir: ""
+
+  command_timeout: 2m
+
+  # Ceiling on a timeout the model asks for.
+  max_command_timeout: 15m
